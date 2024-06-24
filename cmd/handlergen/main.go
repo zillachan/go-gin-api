@@ -25,7 +25,7 @@ func init() {
 
 func main() {
 	fs := token.NewFileSet()
-	filePath := fmt.Sprintf("./internal/api/controller/%s", handlerName)
+	filePath := fmt.Sprintf("./internal/api/%s", handlerName)
 	parsedFile, err := decorator.ParseFile(fs, filePath+"/handler.go", nil, 0)
 	if err != nil {
 		log.Fatalf("parsing package: %s: %s\n", filePath, err)
@@ -59,12 +59,19 @@ func main() {
 						continue
 					}
 
-					filepath := "./internal/api/controller/" + handlerName
+					filepath := "./internal/api/" + handlerName
 					filename := fmt.Sprintf("%s/func_%s.go", filepath, strings.ToLower(v.Names[0].String()))
 					funcFile, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0766)
 					if err != nil {
 						fmt.Printf("create and open func file error %v\n", err.Error())
+						continue
 					}
+
+					if funcFile == nil {
+						fmt.Printf("func file is nil \n")
+						continue
+					}
+
 					fmt.Println("  └── file : ", filename)
 
 					funcContent := fmt.Sprintf("package %s\n\n", handlerName)
@@ -82,14 +89,14 @@ func main() {
 					funcContent += fmt.Sprintf("// @Description%s \n", nameArr[1])
 					// Tags
 					funcContent += fmt.Sprintf("%s \n", v.Decorations().Start.All()[1])
-					funcContent += fmt.Sprintf("// @Accept json \n")
+					funcContent += fmt.Sprintf("// @Accept application/x-www-form-urlencoded \n")
 					funcContent += fmt.Sprintf("// @Produce json \n")
 					funcContent += fmt.Sprintf("// @Param Request body %sRequest true \"请求信息\" \n", Lcfirst(v.Names[0].String()))
 					funcContent += fmt.Sprintf("// @Success 200 {object} %sResponse \n", Lcfirst(v.Names[0].String()))
 					funcContent += fmt.Sprintf("// @Failure 400 {object} code.Failure \n")
 					// Router
 					funcContent += fmt.Sprintf("%s \n", v.Decorations().Start.All()[2])
-					funcContent += fmt.Sprintf("func (h *handler) %s() core.HandlerFunc { \n return func(c core.Context) {\n\n}}", v.Names[0].String())
+					funcContent += fmt.Sprintf("func (h *handler) %s() core.HandlerFunc { \n return func(ctx core.Context) {\n\n}}", v.Names[0].String())
 
 					funcFile.WriteString(funcContent)
 					funcFile.Close()

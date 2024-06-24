@@ -11,6 +11,7 @@ import (
 	"github.com/xinliangnote/go-gin-api/pkg/env"
 	"github.com/xinliangnote/go-gin-api/pkg/logger"
 	"github.com/xinliangnote/go-gin-api/pkg/shutdown"
+	"github.com/xinliangnote/go-gin-api/pkg/timeutil"
 
 	"go.uber.org/zap"
 )
@@ -26,34 +27,54 @@ import (
 // @license.name MIT
 // @license.url https://github.com/xinliangnote/go-gin-api/blob/master/LICENSE
 
-// @host 127.0.0.1:9999
-// @BasePath
+// @securityDefinitions.apikey  LoginToken
+// @in                          header
+// @name                        token
+
+// @BasePath /
 func main() {
-	// 初始化 logger
-	loggers, err := logger.NewJSONLogger(
-		logger.WithField("domain", fmt.Sprintf("%s[%s]", configs.ProjectName(), env.Active().Value())),
-		logger.WithTimeLayout("2006-01-02 15:04:05"),
-		logger.WithFileP(configs.ProjectLogFile()),
+	// 初始化 access logger
+	accessLogger, err := logger.NewJSONLogger(
+		logger.WithDisableConsole(),
+		logger.WithField("domain", fmt.Sprintf("%s[%s]", configs.ProjectName, env.Active().Value())),
+		logger.WithTimeLayout(timeutil.CSTLayout),
+		logger.WithFileP(configs.ProjectAccessLogFile),
 	)
 	if err != nil {
 		panic(err)
 	}
-	defer loggers.Sync()
+
+	// 初始化 cron logger
+	cronLogger, err := logger.NewJSONLogger(
+		logger.WithDisableConsole(),
+		logger.WithField("domain", fmt.Sprintf("%s[%s]", configs.ProjectName, env.Active().Value())),
+		logger.WithTimeLayout(timeutil.CSTLayout),
+		logger.WithFileP(configs.ProjectCronLogFile),
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
+	defer func() {
+		_ = accessLogger.Sync()
+		_ = cronLogger.Sync()
+	}()
 
 	// 初始化 HTTP 服务
-	s, err := router.NewHTTPServer(loggers)
+	s, err := router.NewHTTPServer(accessLogger, cronLogger)
 	if err != nil {
 		panic(err)
 	}
 
 	server := &http.Server{
-		Addr:    configs.ProjectPort(),
+		Addr:    configs.ProjectPort,
 		Handler: s.Mux,
 	}
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			loggers.Fatal("http server startup err", zap.Error(err))
+			accessLogger.Fatal("http server startup err", zap.Error(err))
 		}
 	}()
 
@@ -65,9 +86,7 @@ func main() {
 			defer cancel()
 
 			if err := server.Shutdown(ctx); err != nil {
-				loggers.Error("server shutdown err", zap.Error(err))
-			} else {
-				loggers.Info("server shutdown success")
+				accessLogger.Error("server shutdown err", zap.Error(err))
 			}
 		},
 
@@ -75,15 +94,11 @@ func main() {
 		func() {
 			if s.Db != nil {
 				if err := s.Db.DbWClose(); err != nil {
-					loggers.Error("dbw close err", zap.Error(err))
-				} else {
-					loggers.Info("dbw close success")
+					accessLogger.Error("dbw close err", zap.Error(err))
 				}
 
 				if err := s.Db.DbRClose(); err != nil {
-					loggers.Error("dbr close err", zap.Error(err))
-				} else {
-					loggers.Info("dbr close success")
+					accessLogger.Error("dbr close err", zap.Error(err))
 				}
 			}
 		},
@@ -92,21 +107,15 @@ func main() {
 		func() {
 			if s.Cache != nil {
 				if err := s.Cache.Close(); err != nil {
-					loggers.Error("cache close err", zap.Error(err))
-				} else {
-					loggers.Info("cache close success")
+					accessLogger.Error("cache close err", zap.Error(err))
 				}
 			}
 		},
 
-		// 关闭 gRPC client
+		// 关闭 cron Server
 		func() {
-			if s.GrpClient != nil {
-				if err := s.GrpClient.Conn().Close(); err != nil {
-					loggers.Error("gRPC client close err", zap.Error(err))
-				} else {
-					loggers.Info("gRPC client close success")
-				}
+			if s.CronServer != nil {
+				s.CronServer.Stop()
 			}
 		},
 	)

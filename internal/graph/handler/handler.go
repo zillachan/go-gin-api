@@ -6,9 +6,9 @@ import (
 
 	"github.com/xinliangnote/go-gin-api/internal/graph/generated"
 	"github.com/xinliangnote/go-gin-api/internal/graph/resolvers"
-	"github.com/xinliangnote/go-gin-api/internal/pkg/cache"
 	"github.com/xinliangnote/go-gin-api/internal/pkg/core"
-	"github.com/xinliangnote/go-gin-api/internal/pkg/db"
+	"github.com/xinliangnote/go-gin-api/internal/repository/mysql"
+	"github.com/xinliangnote/go-gin-api/internal/repository/redis"
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/99designs/gqlgen/graphql/handler"
@@ -29,11 +29,11 @@ type Gql interface {
 
 type gql struct {
 	logger *zap.Logger
-	db     db.Repo
-	cache  cache.Repo
+	db     mysql.Repo
+	cache  redis.Repo
 }
 
-func New(logger *zap.Logger, db db.Repo, cache cache.Repo) Gql {
+func New(logger *zap.Logger, db mysql.Repo, cache redis.Repo) Gql {
 	return &gql{
 		logger: logger,
 		cache:  cache,

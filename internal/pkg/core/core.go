@@ -2,23 +2,25 @@ package core
 
 import (
 	"fmt"
+	"html/template"
 	"net/http"
 	"net/url"
 	"runtime/debug"
 	"time"
 
+	"github.com/xinliangnote/go-gin-api/assets"
 	"github.com/xinliangnote/go-gin-api/configs"
 	_ "github.com/xinliangnote/go-gin-api/docs"
-	"github.com/xinliangnote/go-gin-api/internal/api/code"
+	"github.com/xinliangnote/go-gin-api/internal/code"
+	"github.com/xinliangnote/go-gin-api/internal/proposal"
 	"github.com/xinliangnote/go-gin-api/pkg/browser"
 	"github.com/xinliangnote/go-gin-api/pkg/color"
 	"github.com/xinliangnote/go-gin-api/pkg/env"
-	"github.com/xinliangnote/go-gin-api/pkg/errno"
+	"github.com/xinliangnote/go-gin-api/pkg/errors"
 	"github.com/xinliangnote/go-gin-api/pkg/trace"
 
 	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	cors "github.com/rs/cors/wrapper/gin"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -28,6 +30,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// see https://patorjk.com/software/taag/#p=testall&f=Graffiti&t=go-gin-api
 const _UI = `
  ██████╗  ██████╗        ██████╗ ██╗███╗   ██╗       █████╗ ██████╗ ██╗
 ██╔════╝ ██╔═══██╗      ██╔════╝ ██║████╗  ██║      ██╔══██╗██╔══██╗██║
@@ -37,27 +40,18 @@ const _UI = `
  ╚═════╝  ╚═════╝        ╚═════╝ ╚═╝╚═╝  ╚═══╝      ╚═╝  ╚═╝╚═╝     ╚═╝
 `
 
-const _MaxBurstSize = 100000
-
 type Option func(*option)
 
 type option struct {
 	disablePProf      bool
 	disableSwagger    bool
 	disablePrometheus bool
-	panicNotify       OnPanicNotify
-	recordMetrics     RecordMetrics
 	enableCors        bool
 	enableRate        bool
 	enableOpenBrowser string
+	alertNotify       proposal.NotifyHandler
+	recordHandler     proposal.RecordHandler
 }
-
-// OnPanicNotify 发生panic时通知用
-type OnPanicNotify func(ctx Context, err interface{}, stackInfo string)
-
-// RecordMetrics 记录prometheus指标用
-// 如果使用AliasForRecordMetrics配置了别名，uri将被替换为别名。
-type RecordMetrics func(method, uri string, success bool, httpCode, businessCode int, costSeconds float64, traceId string)
 
 // WithDisablePProf 禁用 pprof
 func WithDisablePProf() Option {
@@ -73,25 +67,24 @@ func WithDisableSwagger() Option {
 	}
 }
 
-// WithDisableproPrometheus 禁用prometheus
-func WithDisableproPrometheus() Option {
+// WithDisablePrometheus 禁用prometheus
+func WithDisablePrometheus() Option {
 	return func(opt *option) {
 		opt.disablePrometheus = true
 	}
 }
 
-// WithPanicNotify 设置panic时的通知回调
-func WithPanicNotify(notify OnPanicNotify) Option {
+// WithAlertNotify 设置告警通知
+func WithAlertNotify(notifyHandler proposal.NotifyHandler) Option {
 	return func(opt *option) {
-		opt.panicNotify = notify
-		fmt.Println(color.Green("* [register panic notify]"))
+		opt.alertNotify = notifyHandler
 	}
 }
 
-// WithRecordMetrics 设置记录prometheus记录指标回调
-func WithRecordMetrics(record RecordMetrics) Option {
+// WithRecordMetrics 设置记录接口指标
+func WithRecordMetrics(recordHandler proposal.RecordHandler) Option {
 	return func(opt *option) {
-		opt.recordMetrics = record
+		opt.recordHandler = recordHandler
 	}
 }
 
@@ -102,43 +95,48 @@ func WithEnableOpenBrowser(uri string) Option {
 	}
 }
 
-// WithEnableCors 开启CORS
+// WithEnableCors 设置支持跨域
 func WithEnableCors() Option {
 	return func(opt *option) {
 		opt.enableCors = true
-		fmt.Println(color.Green("* [register cors]"))
 	}
 }
 
+// WithEnableRate 设置支持限流
 func WithEnableRate() Option {
 	return func(opt *option) {
 		opt.enableRate = true
-		fmt.Println(color.Green("* [register rate]"))
 	}
 }
 
-func DisableTrace(ctx Context) {
+// DisableTraceLog 禁止记录日志
+func DisableTraceLog(ctx Context) {
 	ctx.disableTrace()
 }
 
-// AliasForRecordMetrics 对请求uri起个别名，用于prometheus记录指标。
-// 如：Get /user/:username 这样的uri，因为username会有非常多的情况，这样记录prometheus指标会非常的不有好。
+// DisableRecordMetrics 禁止记录指标
+func DisableRecordMetrics(ctx Context) {
+	ctx.disableRecordMetrics()
+}
+
+// AliasForRecordMetrics 对请求路径起个别名，用于记录指标。
+// 如：Get /user/:username 这样的路径，因为 username 会有非常多的情况，这样记录指标非常不友好。
 func AliasForRecordMetrics(path string) HandlerFunc {
 	return func(ctx Context) {
 		ctx.setAlias(path)
 	}
 }
 
-// WrapAuthHandler 用来处理 Auth 的入口，在之后的handler中只需 ctx.UserID() ctx.UserName() 即可。
-func WrapAuthHandler(handler func(Context) (userID int64, userName string, err errno.Error)) HandlerFunc {
+// WrapAuthHandler 用来处理 Auth 的入口
+func WrapAuthHandler(handler func(Context) (sessionUserInfo proposal.SessionUserInfo, err BusinessError)) HandlerFunc {
 	return func(ctx Context) {
-		userID, userName, err := handler(ctx)
+		sessionUserInfo, err := handler(ctx)
 		if err != nil {
 			ctx.AbortWithError(err)
 			return
 		}
-		ctx.setUserID(userID)
-		ctx.setUserName(userName)
+
+		ctx.setSessionUserInfo(sessionUserInfo)
 	}
 }
 
@@ -246,19 +244,16 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 	}
 
 	gin.SetMode(gin.ReleaseMode)
-	gin.DisableBindValidation()
 	mux := &mux{
 		engine: gin.New(),
 	}
 
 	fmt.Println(color.Blue(_UI))
-	fmt.Println(color.Green(fmt.Sprintf("* [register port %s]", configs.ProjectPort())))
-	fmt.Println(color.Green(fmt.Sprintf("* [register env %s]", env.Active().Value())))
 
-	mux.engine.StaticFS("bootstrap", http.Dir("./assets/bootstrap"))
-	mux.engine.LoadHTMLGlob("./assets/templates/**/*")
+	mux.engine.StaticFS("assets", http.FS(assets.Bootstrap))
+	mux.engine.SetHTMLTemplate(template.Must(template.New("").ParseFS(assets.Templates, "templates/**/*")))
 
-	// withoutLogPaths 这些请求，默认不记录日志
+	// withoutTracePaths 这些请求，默认不记录日志
 	withoutTracePaths := map[string]bool{
 		"/metrics": true,
 
@@ -287,20 +282,17 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 	if !opt.disablePProf {
 		if !env.Active().IsPro() {
 			pprof.Register(mux.engine) // register pprof to gin
-			fmt.Println(color.Green("* [register pprof]"))
 		}
 	}
 
 	if !opt.disableSwagger {
 		if !env.Active().IsPro() {
 			mux.engine.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler)) // register swagger
-			fmt.Println(color.Green("* [register swagger]"))
 		}
 	}
 
 	if !opt.disablePrometheus {
 		mux.engine.GET("/metrics", gin.WrapH(promhttp.Handler())) // register prometheus
-		fmt.Println(color.Green("* [register prometheus]"))
 	}
 
 	if opt.enableCors {
@@ -322,7 +314,6 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 
 	if opt.enableOpenBrowser != "" {
 		_ = browser.Open(opt.enableOpenBrowser)
-		fmt.Println(color.Green("* [register open browser '" + opt.enableOpenBrowser + "']"))
 	}
 
 	// recover两次，防止处理时发生panic，尤其是在OnPanicNotify中。
@@ -337,6 +328,11 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 	})
 
 	mux.engine.Use(func(ctx *gin.Context) {
+
+		if ctx.Writer.Status() == http.StatusNotFound {
+			return
+		}
+
 		ts := time.Now()
 
 		context := newContext(ctx)
@@ -344,6 +340,7 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 
 		context.init()
 		context.setLogger(logger)
+		context.ableRecordMetrics()
 
 		if !withoutTracePaths[ctx.Request.URL.Path] {
 			if traceId := context.GetHeader(trace.Header); traceId != "" {
@@ -354,24 +351,6 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 		}
 
 		defer func() {
-			if err := recover(); err != nil {
-				stackInfo := string(debug.Stack())
-				logger.Error("got panic", zap.String("panic", fmt.Sprintf("%+v", err)), zap.String("stack", stackInfo))
-				context.AbortWithError(errno.NewError(
-					http.StatusInternalServerError,
-					code.ServerError,
-					code.Text(code.ServerError)),
-				)
-
-				if notify := opt.panicNotify; notify != nil {
-					notify(context, err, stackInfo)
-				}
-			}
-
-			if ctx.Writer.Status() == http.StatusNotFound {
-				return
-			}
-
 			var (
 				response        interface{}
 				businessCode    int
@@ -381,57 +360,103 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 				graphResponse   interface{}
 			)
 
+			if ct := context.Trace(); ct != nil {
+				context.SetHeader(trace.Header, ct.ID())
+				traceId = ct.ID()
+			}
+
+			// region 发生 Panic 异常发送告警提醒
+			if err := recover(); err != nil {
+				stackInfo := string(debug.Stack())
+				logger.Error("got panic", zap.String("panic", fmt.Sprintf("%+v", err)), zap.String("stack", stackInfo))
+				context.AbortWithError(Error(
+					http.StatusInternalServerError,
+					code.ServerError,
+					code.Text(code.ServerError)),
+				)
+
+				if notifyHandler := opt.alertNotify; notifyHandler != nil {
+					notifyHandler(&proposal.AlertMessage{
+						ProjectName:  configs.ProjectName,
+						Env:          env.Active().Value(),
+						TraceID:      traceId,
+						HOST:         context.Host(),
+						URI:          context.URI(),
+						Method:       context.Method(),
+						ErrorMessage: err,
+						ErrorStack:   stackInfo,
+						Timestamp:    time.Now(),
+					})
+				}
+			}
+			// endregion
+
+			// region 发生错误，进行返回
 			if ctx.IsAborted() {
-				for i := range ctx.Errors { // gin error
+				for i := range ctx.Errors {
 					multierr.AppendInto(&abortErr, ctx.Errors[i])
 				}
 
 				if err := context.abortError(); err != nil { // customer err
-					multierr.AppendInto(&abortErr, err.GetErr())
-					response = err
-					businessCode = err.GetBusinessCode()
-					businessCodeMsg = err.GetMsg()
-
-					if x := context.Trace(); x != nil {
-						context.SetHeader(trace.Header, x.ID())
-						traceId = x.ID()
+					// 判断是否需要发送告警通知
+					if err.IsAlert() {
+						if notifyHandler := opt.alertNotify; notifyHandler != nil {
+							notifyHandler(&proposal.AlertMessage{
+								ProjectName:  configs.ProjectName,
+								Env:          env.Active().Value(),
+								TraceID:      traceId,
+								HOST:         context.Host(),
+								URI:          context.URI(),
+								Method:       context.Method(),
+								ErrorMessage: err.Message(),
+								ErrorStack:   fmt.Sprintf("%+v", err.StackError()),
+								Timestamp:    time.Now(),
+							})
+						}
 					}
 
-					ctx.JSON(err.GetHttpCode(), &code.Failure{
+					multierr.AppendInto(&abortErr, err.StackError())
+					businessCode = err.BusinessCode()
+					businessCodeMsg = err.Message()
+					response = &code.Failure{
 						Code:    businessCode,
 						Message: businessCodeMsg,
-					})
-				}
-			} else {
-				response = context.getPayload()
-				if response != nil {
-					if x := context.Trace(); x != nil {
-						context.SetHeader(trace.Header, x.ID())
-						traceId = x.ID()
 					}
-					ctx.JSON(http.StatusOK, response)
+					ctx.JSON(err.HTTPCode(), response)
 				}
 			}
+			// endregion
 
-			graphResponse = context.getGraphPayload()
+			// region 正确返回
+			response = context.getPayload()
+			if response != nil {
+				ctx.JSON(http.StatusOK, response)
+			}
+			// endregion
 
-			if opt.recordMetrics != nil {
-				uri := context.URI()
+			// region 记录指标
+			if opt.recordHandler != nil && context.isRecordMetrics() {
+				path := context.Path()
 				if alias := context.Alias(); alias != "" {
-					uri = alias
+					path = alias
 				}
 
-				opt.recordMetrics(
-					context.Method(),
-					uri,
-					!ctx.IsAborted() && ctx.Writer.Status() == http.StatusOK,
-					ctx.Writer.Status(),
-					businessCode,
-					time.Since(ts).Seconds(),
-					traceId,
-				)
+				opt.recordHandler(&proposal.MetricsMessage{
+					ProjectName:  configs.ProjectName,
+					Env:          env.Active().Value(),
+					TraceID:      traceId,
+					HOST:         context.Host(),
+					Path:         path,
+					Method:       context.Method(),
+					HTTPCode:     ctx.Writer.Status(),
+					BusinessCode: businessCode,
+					CostSeconds:  time.Since(ts).Seconds(),
+					IsSuccess:    !ctx.IsAborted() && (ctx.Writer.Status() == http.StatusOK),
+				})
 			}
+			// endregion
 
+			// region 记录日志
 			var t *trace.Trace
 			if x := context.Trace(); x != nil {
 				t = x.(*trace.Trace)
@@ -440,11 +465,20 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 			}
 
 			decodedURL, _ := url.QueryUnescape(ctx.Request.URL.RequestURI())
+
+			// ctx.Request.Header，精简 Header 参数
+			traceHeader := map[string]string{
+				"Content-Type":              ctx.GetHeader("Content-Type"),
+				configs.HeaderLoginToken:    ctx.GetHeader(configs.HeaderLoginToken),
+				configs.HeaderSignToken:     ctx.GetHeader(configs.HeaderSignToken),
+				configs.HeaderSignTokenDate: ctx.GetHeader(configs.HeaderSignTokenDate),
+			}
+
 			t.WithRequest(&trace.Request{
 				TTL:        "un-limit",
 				Method:     ctx.Request.Method,
 				DecodedURL: decodedURL,
-				Header:     ctx.Request.Header,
+				Header:     traceHeader,
 				Body:       string(context.RawData()),
 			})
 
@@ -454,6 +488,7 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 				responseBody = response
 			}
 
+			graphResponse = context.getGraphPayload()
 			if graphResponse != nil {
 				responseBody = graphResponse
 			}
@@ -468,10 +503,10 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 				CostSeconds:     time.Since(ts).Seconds(),
 			})
 
-			t.Success = !ctx.IsAborted() && ctx.Writer.Status() == http.StatusOK
+			t.Success = !ctx.IsAborted() && (ctx.Writer.Status() == http.StatusOK)
 			t.CostSeconds = time.Since(ts).Seconds()
 
-			logger.Info("core-interceptor",
+			logger.Info("trace-log",
 				zap.Any("method", ctx.Request.Method),
 				zap.Any("path", decodedURL),
 				zap.Any("http_code", ctx.Writer.Status()),
@@ -482,19 +517,20 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 				zap.Any("trace_info", t),
 				zap.Error(abortErr),
 			)
+			// endregion
 		}()
 
 		ctx.Next()
 	})
 
 	if opt.enableRate {
-		limiter := rate.NewLimiter(rate.Every(time.Second*1), _MaxBurstSize)
+		limiter := rate.NewLimiter(rate.Every(time.Second*1), configs.MaxRequestsPerSecond)
 		mux.engine.Use(func(ctx *gin.Context) {
 			context := newContext(ctx)
 			defer releaseContext(context)
 
 			if !limiter.Allow() {
-				context.AbortWithError(errno.NewError(
+				context.AbortWithError(Error(
 					http.StatusTooManyRequests,
 					code.TooManyRequests,
 					code.Text(code.TooManyRequests)),
@@ -506,8 +542,9 @@ func New(logger *zap.Logger, options ...Option) (Mux, error) {
 		})
 	}
 
-	mux.engine.NoMethod(wrapHandlers(DisableTrace)...)
-	mux.engine.NoRoute(wrapHandlers(DisableTrace)...)
+	mux.engine.NoMethod(wrapHandlers(DisableTraceLog)...)
+	mux.engine.NoRoute(wrapHandlers(DisableTraceLog)...)
+
 	system := mux.Group("/system")
 	{
 		// 健康检查

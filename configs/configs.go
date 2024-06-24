@@ -1,10 +1,15 @@
 package configs
 
 import (
-	"fmt"
+	"bytes"
+	_ "embed"
+	"io"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/xinliangnote/go-gin-api/pkg/env"
+	"github.com/xinliangnote/go-gin-api/pkg/file"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
@@ -50,33 +55,75 @@ type Config struct {
 		To   string `toml:"to"`
 	} `toml:"mail"`
 
-	JWT struct {
-		Secret         string        `toml:"secret"`
-		ExpireDuration time.Duration `toml:"expireDuration"`
-	} `toml:"jwt"`
-
-	URLToken struct {
-		Secret         string        `toml:"secret"`
-		ExpireDuration time.Duration `toml:"expireDuration"`
-	} `toml:"urlToken"`
-
 	HashIds struct {
 		Secret string `toml:"secret"`
 		Length int    `toml:"length"`
 	} `toml:"hashids"`
+
+	Language struct {
+		Local string `toml:"local"`
+	} `toml:"language"`
 }
 
-func init() {
-	viper.SetConfigName(env.Active().Value() + "_configs")
-	viper.SetConfigType("toml")
-	viper.AddConfigPath("./configs")
+var (
+	//go:embed dev_configs.toml
+	devConfigs []byte
 
-	if err := viper.ReadInConfig(); err != nil {
+	//go:embed fat_configs.toml
+	fatConfigs []byte
+
+	//go:embed uat_configs.toml
+	uatConfigs []byte
+
+	//go:embed pro_configs.toml
+	proConfigs []byte
+)
+
+func init() {
+	var r io.Reader
+
+	switch env.Active().Value() {
+	case "dev":
+		r = bytes.NewReader(devConfigs)
+	case "fat":
+		r = bytes.NewReader(fatConfigs)
+	case "uat":
+		r = bytes.NewReader(uatConfigs)
+	case "pro":
+		r = bytes.NewReader(proConfigs)
+	default:
+		r = bytes.NewReader(fatConfigs)
+	}
+
+	viper.SetConfigType("toml")
+
+	if err := viper.ReadConfig(r); err != nil {
 		panic(err)
 	}
 
 	if err := viper.Unmarshal(config); err != nil {
 		panic(err)
+	}
+
+	viper.SetConfigName(env.Active().Value() + "_configs")
+	viper.AddConfigPath("./configs")
+
+	configFile := "./configs/" + env.Active().Value() + "_configs.toml"
+	_, ok := file.IsExists(configFile)
+	if !ok {
+		if err := os.MkdirAll(filepath.Dir(configFile), 0766); err != nil {
+			panic(err)
+		}
+
+		f, err := os.Create(configFile)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+
+		if err := viper.WriteConfig(); err != nil {
+			panic(err)
+		}
 	}
 
 	viper.WatchConfig()
@@ -89,20 +136,4 @@ func init() {
 
 func Get() Config {
 	return *config
-}
-
-func ProjectName() string {
-	return "go-gin-api"
-}
-
-func ProjectPort() string {
-	return ":9999"
-}
-
-func ProjectLogFile() string {
-	return fmt.Sprintf("./logs/%s-access.log", ProjectName())
-}
-
-func ProjectInstallFile() string {
-	return "INSTALL.lock"
 }
